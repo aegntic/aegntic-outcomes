@@ -1,0 +1,18 @@
+{
+  "name": "aegntic-knowledge-engine",
+  "version": "1.0.0",
+  "description": "Sourced decision plus reusable, versioned knowledge",
+  "author": {
+    "name": "aegntic",
+    "email": "team@aegntic.ai"
+  },
+  "repository": "https://github.com/aegntic/cognitive-os",
+  "license": "MIT",
+  "keywords": [
+    "aegntic",
+    "knowledge-engine",
+    "outcome-workflow",
+    "claim-lineage",
+    "knowledge-compounding"
+  ]
+}

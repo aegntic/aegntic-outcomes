@@ -1,0 +1,19 @@
+{
+  "name": "aegntic-agent-evolution",
+  "version": "1.0.0",
+  "description": "Tested workflow candidate and reversible promotion decision",
+  "author": {
+    "name": "aegntic",
+    "email": "team@aegntic.ai"
+  },
+  "repository": "https://github.com/aegntic/cognitive-os",
+  "license": "MIT",
+  "keywords": [
+    "aegntic",
+    "agent-evolution",
+    "outcome-workflow",
+    "task-bank",
+    "paired-evaluation",
+    "promotion-gate"
+  ]
+}

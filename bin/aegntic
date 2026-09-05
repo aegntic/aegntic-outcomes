@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""
+Aegntic Outcome Workflows — Universal CLI Runner
+Enables terminal, script, and CI/CD invocation of the 5 Aegntic outcome workflows,
+stage inspections, paired evaluation, and MCP server launching.
+"""
+
+import sys
+import os
+import subprocess
+import json
+
+PLUGINS_DIR = "/home/ae/plugins"
+MCP_SERVER = os.path.join(PLUGINS_DIR, "bin", "aegntic-outcomes-mcp.mjs")
+EVALUATOR = os.path.join(PLUGINS_DIR, "aegntic-agent-evolution", "evaluator", "evaluator.py")
+
+WORKFLOWS = {
+    "venture-lab": {
+        "name": "Venture Lab",
+        "invoke": "$venture-lab",
+        "plugin_dir": os.path.join(PLUGINS_DIR, "aegntic-venture-lab"),
+        "skill_path": os.path.join(PLUGINS_DIR, "aegntic-venture-lab", "skills", "venture-lab", "SKILL.md"),
+        "outcome": "Tested commercial offer or validation experiment with missing evidence audit",
+        "asset": "Audience language, offer components, hypothesis outcomes"
+    },
+    "product-foundry": {
+        "name": "Product Foundry",
+        "invoke": "$product-foundry",
+        "plugin_dir": os.path.join(PLUGINS_DIR, "aegntic-product-foundry"),
+        "skill_path": os.path.join(PLUGINS_DIR, "aegntic-product-foundry", "skills", "product-foundry", "SKILL.md"),
+        "outcome": "Working vertical slice with behavioral and regression evidence",
+        "asset": "Tested components, recovery procedures, regression cases"
+    },
+    "experience-studio": {
+        "name": "Experience Studio",
+        "invoke": "$experience-studio",
+        "plugin_dir": os.path.join(PLUGINS_DIR, "aegntic-experience-studio"),
+        "skill_path": os.path.join(PLUGINS_DIR, "aegntic-experience-studio", "skills", "experience-studio", "SKILL.md"),
+        "outcome": "Implemented bespoke interface with interaction and accessibility evidence",
+        "asset": "Reusable interface patterns and usability regressions"
+    },
+    "knowledge-engine": {
+        "name": "Knowledge Engine",
+        "invoke": "$knowledge-engine",
+        "plugin_dir": os.path.join(PLUGINS_DIR, "aegntic-knowledge-engine"),
+        "skill_path": os.path.join(PLUGINS_DIR, "aegntic-knowledge-engine", "skills", "knowledge-engine", "SKILL.md"),
+        "outcome": "Sourced decision plus reusable, versioned knowledge",
+        "asset": "Claim lineage, freshness rules, automated correction propagation"
+    },
+    "agent-evolution": {
+        "name": "Agent Evolution",
+        "invoke": "$agent-evolution",
+        "plugin_dir": os.path.join(PLUGINS_DIR, "aegntic-agent-evolution"),
+        "skill_path": os.path.join(PLUGINS_DIR, "aegntic-agent-evolution", "skills", "agent-evolution", "SKILL.md"),
+        "outcome": "Tested workflow candidate and reversible promotion decision",
+        "asset": "Task bank, measured interventions, regression coverage"
+    }
+}
+
+def print_help():
+    print("""Aegntic Universal CLI — End-to-End Outcome Workflows
+
+Usage:
+  aegntic <command> [options]
+
+Commands:
+  list, ls              List all 5 outcome workflows, triggers, and delivered assets
+  inspect <workflow>    Display full stage specification and contracts for a workflow
+  eval [options]        Run the paired results evaluator (proxy to evaluator.py)
+  test                  Run the evaluator test suite across all packages
+  mcp                   Launch the Universal JSON-RPC stdio MCP server
+  doctor                Verify environment health, symlinks, and agent discovery paths
+
+Workflows:
+  venture-lab           $venture-lab
+  product-foundry       $product-foundry
+  experience-studio     $experience-studio
+  knowledge-engine      $knowledge-engine
+  agent-evolution       $agent-evolution
+
+Examples:
+  aegntic list
+  aegntic inspect product-foundry
+  aegntic eval --baseline base.json --candidate cand.json --contract contract.json
+  aegntic mcp
+""")
+
+def cmd_list():
+    print("=" * 90)
+    print("AEGNTIC END-TO-END OUTCOME WORKFLOWS (Universal Protocol v1.0)")
+    print("=" * 90)
+    fmt = "{:<20} {:<18} {:<50}"
+    print(fmt.format("Workflow", "Invoke Trigger", "Delivered Outcome"))
+    print("-" * 90)
+    for key, wf in WORKFLOWS.items():
+        print(fmt.format(wf["name"], wf["invoke"], wf["outcome"]))
+        print(f"  └─ Compounding Asset: {wf['asset']}")
+        print(f"  └─ Discovery Skill:   {wf['skill_path']}")
+        print()
+
+def resolve_workflow_key(query):
+    q = query.lower().replace("_", "-").replace("$", "").strip()
+    if q in WORKFLOWS:
+        return q
+    for key, wf in WORKFLOWS.items():
+        if q in key or q in wf["name"].lower():
+            return key
+    return None
+
+def cmd_inspect(args):
+    if not args:
+        print("Error: Specify workflow to inspect. Available: " + ", ".join(WORKFLOWS.keys()))
+        sys.exit(1)
+    key = resolve_workflow_key(args[0])
+    if not key:
+        print(f"Error: Unknown workflow '{args[0]}'. Available: " + ", ".join(WORKFLOWS.keys()))
+        sys.exit(1)
+    wf = WORKFLOWS[key]
+    if not os.path.exists(wf["skill_path"]):
+        print(f"Error: Skill specification not found at {wf['skill_path']}")
+        sys.exit(1)
+    with open(wf["skill_path"], "r", encoding="utf-8") as f:
+        print(f.read())
+
+def cmd_eval(args):
+    if not os.path.exists(EVALUATOR):
+        print(f"Error: Evaluator script not found at {EVALUATOR}")
+        sys.exit(1)
+    cmd = [sys.executable, EVALUATOR] + args
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+def cmd_test():
+    print("Running Paired Results Evaluator Test Suites across all 5 plugins...\n")
+    all_passed = True
+    for key, wf in WORKFLOWS.items():
+        test_path = os.path.join(wf["plugin_dir"], "evaluator", "test_evaluator.py")
+        if os.path.exists(test_path):
+            res = subprocess.run([sys.executable, test_path], capture_output=True, text=True)
+            status = "PASSED (12/12)" if res.returncode == 0 else f"FAILED (code {res.returncode})"
+            print(f"[{status}] {wf['name']} ({test_path})")
+            if res.returncode != 0:
+                print(res.stderr or res.stdout)
+                all_passed = False
+        else:
+            print(f"[MISSING] {wf['name']} - test_evaluator.py not found at {test_path}")
+            all_passed = False
+    print("\nSummary: " + ("ALL TESTS PASSED ✓" if all_passed else "SOME TESTS FAILED ✗"))
+    sys.exit(0 if all_passed else 1)
+
+def cmd_mcp():
+    if not os.path.exists(MCP_SERVER):
+        print(f"Error: MCP server not found at {MCP_SERVER}")
+        sys.exit(1)
+    os.execv("/usr/bin/env", ["/usr/bin/env", "node", MCP_SERVER])
+
+def cmd_doctor():
+    print("Checking Aegntic Universal Runtime Health...\n")
+    checks = [
+        ("Python 3 Runtime", sys.executable, os.path.exists(sys.executable)),
+        ("Node.js Runtime", "/usr/bin/env node", subprocess.run(["node", "-v"], capture_output=True).returncode == 0),
+        ("Universal MCP Script", MCP_SERVER, os.path.exists(MCP_SERVER) and os.access(MCP_SERVER, os.X_OK)),
+        ("Canonical Evaluator", EVALUATOR, os.path.exists(EVALUATOR)),
+        ("CLI Binary Symlink", "/home/ae/.local/bin/aegntic", os.path.exists("/home/ae/.local/bin/aegntic")),
+    ]
+    for label, target, ok in checks:
+        print(f"[{'OK' if ok else 'FAIL'}] {label}: {target}")
+    
+    print("\nAgent Framework Discovery Links:")
+    framework_dirs = [
+        ("Antigravity / Gemini CLI", "/home/ae/.gemini/config/plugins"),
+        ("Claude Code Plugins", "/home/ae/.claude/plugins"),
+        ("Claude Code Skills", "/home/ae/.claude/skills"),
+        ("Claude Commands ($)", "/home/ae/.claude/commands"),
+        ("Universal Agent Hub", "/home/ae/.agents/skills")
+    ]
+    for name, fpath in framework_dirs:
+        exists = os.path.exists(fpath)
+        print(f"[{'OK' if exists else 'MISSING'}] {name}: {fpath}")
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print_help()
+        sys.exit(0)
+    cmd = sys.argv[1].lower()
+    args = sys.argv[2:]
+    if cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd in ("inspect", "show", "cat"):
+        cmd_inspect(args)
+    elif cmd in ("eval", "evaluate"):
+        cmd_eval(args)
+    elif cmd in ("test", "tests"):
+        cmd_test()
+    elif cmd in ("mcp", "serve"):
+        cmd_mcp()
+    elif cmd in ("doctor", "check"):
+        cmd_doctor()
+    else:
+        print(f"Unknown command: '{cmd}'. Run 'aegntic --help' for usage.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

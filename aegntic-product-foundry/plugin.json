@@ -1,0 +1,18 @@
+{
+  "name": "aegntic-product-foundry",
+  "version": "1.0.0",
+  "description": "Working vertical slice with behavioral and regression evidence",
+  "author": {
+    "name": "aegntic",
+    "email": "team@aegntic.ai"
+  },
+  "repository": "https://github.com/aegntic/cognitive-os",
+  "license": "MIT",
+  "keywords": [
+    "aegntic",
+    "product-foundry",
+    "outcome-workflow",
+    "vertical-slice",
+    "regression-evidence"
+  ]
+}
