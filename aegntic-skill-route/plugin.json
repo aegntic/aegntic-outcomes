@@ -1,0 +1,34 @@
+{
+  "name": "aegntic-skill-route",
+  "version": "1.0.0",
+  "description": "Deterministic intent-to-skill router with phantom protection and a self-contained vendor bundle",
+  "author": {
+    "name": "aegntic",
+    "email": "team@aegntic.ai"
+  },
+  "repository": "https://github.com/aegntic/aegntic-outcomes",
+  "license": "MIT",
+  "keywords": [
+    "aegntic",
+    "skill-route",
+    "skill-routing",
+    "orchestration",
+    "dependency-management",
+    "harness-agnostic"
+  ],
+  "invoke": "$skill-route",
+  "entrypoint": "bin/skill-route",
+  "runtime": {
+    "language": "python3",
+    "dependencies": [],
+    "min_python": "3.9"
+  },
+  "metrics": {
+    "routers": 41,
+    "warm_query_ms": 58,
+    "cold_index_s": 2.5,
+    "peak_rss_mb": 25,
+    "test_checks": 62,
+    "test_gates": 8
+  }
+}

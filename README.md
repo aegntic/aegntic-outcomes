@@ -11,7 +11,7 @@ Works natively across:
 
 ---
 
-## The 5 Outcome Workflows
+## The Outcome Workflows & Skill Route
 
 | Workflow | Native Invoke | Delivered Outcome | Compounding Asset |
 | :--- | :--- | :--- | :--- |
@@ -20,6 +20,7 @@ Works natively across:
 | **Experience Studio** | `$experience-studio` | Implemented bespoke interface with interaction and accessibility evidence | Reusable interface patterns and usability regressions |
 | **Knowledge Engine** | `$knowledge-engine` | Sourced decision plus reusable, versioned knowledge | Claim lineage, freshness rules, automated correction propagation |
 | **Agent Evolution** | `$agent-evolution` | Tested workflow candidate and reversible promotion decision | Task bank, measured interventions, regression coverage |
+| **Skill Route** | `$skill-route` | One named skill per request, with evidence, or an explicit "no route" | Routing table, dependency manifest, phantom-protection gates |
 
 ---
 

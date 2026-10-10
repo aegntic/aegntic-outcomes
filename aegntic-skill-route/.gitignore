@@ -1,0 +1,9 @@
+# Runtime artifact — rebuilt by `./install.sh --bundle`.
+# Contains third-party skills under their own upstream licenses; not ours to
+# redistribute. See manifest.json for the authoritative dependency list.
+vendor/
+
+__pycache__/
+*.pyc
+.ruff_cache/
+.skill-route-install

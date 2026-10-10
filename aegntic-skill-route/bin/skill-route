@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+skill-route — deterministic intent -> skill resolver.
+
+Design constraints:
+  1. READ-ONLY. Never writes to, moves, or deletes any skill.
+  2. STATELESS by default. Caches a corpus index; rebuilds it only if stale.
+  3. DEGRADES. If the corpus is unreachable, says so instead of guessing.
+  4. EXPLAINABLE. Every answer carries the evidence that produced it.
+
+Usage:
+  skill-route "why is my test failing"          # ranked skills + reason
+  skill-route --index                           # corpus stats only
+  skill-route --contested                       # skills with >1 path (mirrors)
+  skill-route --dead                            # content-free import stubs
+  skill-route --resolve <name>                  # canonical path + copies
+  skill-route --refresh                         # rebuild cache
+"""
+from __future__ import annotations
+import json, os, re, sys, time, hashlib
+from pathlib import Path
+
+VERSION = "1.0.0"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "skill-route" / "index.json"
+CACHE_TTL = 3600
+
+# ── intent → router table ────────────────────────────────────────────────────
+# Ordered: first match wins per line. These are the decisions, not the library.
+ROUTES: list[tuple[str, list[str]]] = [
+    (r"\b(root ?cause|why is|why does|debug|diagnos|investigat|regress|stack ?trace|"
+     r"error|failing test|broken|it was working|intermittent|flak)", ["investigate"]),
+    # No standalone build-fix skill exists in any known corpus — only a
+    # content-free stub (source-command-build-fix). Build failures are
+    # root-cause work, which is investigate's job. Routing to a name that
+    # does not exist would be a phantom; this is not.
+    (r"\b(build (is )?broken|type error|compile (error|fail)|lint error|"
+     r"doesn'?t compile|\bgradle\b|\bcargo build\b|\btsc\b)", ["investigate"]),
+    (r"\b(security|vulnerab\w*|exploit\w*|threat model|owasp|str[ide]\b|cve\b|"
+     r"secret.{0,12}scan|authz|injection|xss|sql ?i\b|is it safe|pen ?test|"
+     r"secure|attack surface|supply chain)", ["cso"]),
+    (r"\b(review (my |the )?diff|code review|pre-?landing|ready to merge|"
+     r"review this pr|pull request review|look at my diff)", ["review"]),
+    (r"\b(ship|open a pr|raise a pr|commit and push|push this|release)\b", ["ship"]),
+    (r"\b(merge it|land|deploy|release to prod|promote)", ["land-and-deploy"]),
+    (r"\b(canary|post.?deploy|monitor prod|watch production)", ["canary"]),
+    (r"\b(qa|quality assurance|test the (site|app)|dogfood|what'?s broken in the app|"
+     r"e2e)\b", ["qa"]),
+    (r"\b(screenshot|click through|fill (the )?form|browser autom|playwright|"
+     r"puppeteer|headless)", ["browse"]),
+    (r"\b(scrape|extract.*(page|data)|pull data from|what'?s on this page)", ["scrape"]),
+    (r"\b(make (this |it )?(bolder|quieter|more polished|less bland|calmer|"
+     r"louder|brighter|denser)|too (boring|safe|loud|bland|busy|plain)|"
+     r"add color|more personality|redesign this|ui polish|make it pop|"
+     r"tone (it )?down|strip (this )?down|feels dated)", ["impeccable"]),
+    (r"\b(design system|brand guidelines|palette|typography|motion system|design\.md)", ["design-consultation"]),
+    (r"\b(design review|does this look right|design qa|visual (audit|qa)|"
+     r"a11y|wcag|contrast check)", ["design-review"]),
+    (r"\b(think bigger|ambitious|is this worth|10-?star|expand scope|"
+     r"challenge (this|the) (plan|scope))", ["plan-ceo-review"]),
+    (r"\b(review the architecture|architecture review|data flow|design doc|"
+     r"technical review|eng review|lock in the plan)", ["plan-eng-review"]),
+    (r"\b(auto ?review|review (all|every) review|autoplan)", ["autoplan"]),
+    (r"\b(deep (dive|research)|exhaustive research|multi-?source)", ["deep-research"]),
+    (r"\b(research|find out|look up|what'?s true|investigate (a )?question|"
+     r"gather sources|cite)", ["research"]),
+    (r"\b(spec this|write (me )?a (spec|ticket|issue)|turn (this|vague) into)", ["spec"]),
+    (r"\b(test.?first|tdd|red.?green|write (the )?tests? first|tests? first|"
+     r"add tests?|write tests|coverage gap|test coverage|unit tests)", ["tdd"]),
+    (r"\b(create|write|author|make) a skill|new skill\b", ["skill-creator"]),
+    (r"\b(which skills (does|do) (this|the) (repo|project)|install skills|"
+     r"trim (my |our )?skills|what skills (do|does) (this|the) (repo|project))", ["agent-sort"]),
+    (r"\b(audit (my |our )?skills|score (the |my )?skills|skill health|"
+     r"which skills|clean up skills|are my skills good)", ["skill-stocktake"]),
+    (r"\b(generate (a |an )?(video|image|thumbnail|audio)|make (me )?a video|"
+     r"seedance|higgsfield|text.?to.?video|thumbnail)", ["higgsfield-generate"]),
+    (r"\b(improve (my )?seo|not ranking|seo audit|search console|meta description|"
+     r"schema\.org|sitemap)", ["seo"]),
+    (r"\b(save (my )?progress|hand ?(this )?off|checkpoint|context is running out|"
+     r"pick up where|resume|summarize (this )?conversation)", ["context-save"]),
+    (r"\b(poke holes|what could go wrong|attack (this|the) (plan|design)|"
+     r"red team (this|the))", ["hate"]),
+    (r"\b(give me ideas|what should i improve|brainstorm|ideate|options for)", ["ideate"]),
+    (r"\b(how does (this|the) (codebase|repo|project) work|dependency graph|"
+     r"what depends on|code map|knowledge graph of)", ["graphify"]),
+    (r"\b(run this|prove it worked|execute (this )?command|check the repo|"
+     r"ci (is )?(red|failing))", ["terminal-ops"]),
+]
+
+# ── library (reference) hints ────────────────────────────────────────────────
+# Load-on-trigger material. Not decisions. Never a routing destination alone.
+REFERENCE_HINTS = re.compile(
+    r"(patterns?|security|testing|tdd|verification|coding-standards|conventions|"
+    r"-migration|error-handling|api-design|clean-architecture)", re.I)
+
+STUB_RE = re.compile(r'^\s*description:\s*["\']?Migrated source command', re.M | re.I)
+HOSTS = re.compile(r"\.(claude|cursor|factory|gbrain|hermes|kiro|openclaw|opencode|slate|codex|agents)(?=/)")
+
+# Words that coincide with skill names but carry no routing signal.
+STOPWORDS = {
+    "why", "how", "what", "when", "where", "which", "this", "that", "with",
+    "the", "and", "for", "from", "into", "make", "get", "use", "run", "add",
+    "fix", "try", "need", "want", "help", "can", "does", "did", "was",
+    "test", "tests", "code", "file", "files", "project", "work", "thing",
+    "stuff", "please", "should", "would", "could", "there", "then", "than",
+    "about", "them", "they", "been", "being", "have", "has", "had", "will",
+    "some", "more", "most", "just", "very", "much", "many", "good", "better",
+    "best", "first", "last", "next", "one", "two", "all", "any", "own",
+    "skill", "skills", "work", "thing",
+}
+
+# Single-word skill names that are unambiguous when named outright. These are
+# the impeccable verb family — real, installed, and the thing the user asked
+# for. Other single-word names (audit, youtube, research) collide with common
+# English and stay out of the exact-match path.
+SINGLE_WORD_OK = {
+    "bolder", "quieter", "colorize", "distill", "delight", "animate", "adapt",
+    "harden", "typeset", "clarify", "polish", "critique", "debloat", "dedash",
+    "reorder", "prototype", "research", "ideate", "ship", "review", "spec",
+    "tdd", "browse", "scrape", "qa", "seo", "banana", "implement", "teach",
+    "grilling", "hate", "handoff", "deploy", "lfg", "sip", "thin", "re0",
+}
+
+# Design verbs. Each maps to the modifier skill that owns it; impeccable is
+# appended because every one of these opens with "Invoke /impeccable".
+MODIFIER_ROUTES: list[tuple[str, str]] = [
+    (r"\bbolder\b|\btoo (boring|safe|plain)\b|\bmore (impact|drama)\b", "bolder"),
+    (r"\bquieter\b|\btoo (loud|bold|busy|aggressive)\b|\btone (it |this )?down\b|"
+     r"\btoo (stimulating|much)\b", "quieter"),
+    (r"\bcolou?ri[sz]e\b|\btoo (gray|grey|monochromatic)\b|\badd color\b", "colorize"),
+    (r"\bdistill\b|\bsimplif\w+\b|\bstrip (this |it )?down\b|\btoo complex\b", "distill"),
+    (r"\bdelight\b|\bmore personality\b|\bcharm\b|\bmemorable\b", "delight"),
+    (r"\banimate\b|\badd motion\b|\bmicro.?interaction", "animate"),
+    (r"\badapt\b|\bresponsive\b|\bmobile layout\b|\bbreakpoint", "adapt"),
+    (r"\bharden\b|\berror state\b|\bedge case", "harden"),
+    (r"\btypeset\b|\btypography\b|\bfont\b|\btype hierarchy\b", "typeset"),
+    (r"\bclarify\b|\bmicrocopy\b|\bunclear (copy|text|error)\b|\blabel", "clarify"),
+    (r"\boverdrive\b|\btechnically ambitious\b|\bpush (it|past) (further|conventional)", "overdrive"),
+    (r"\bpolish\b|\bfinal (pass|quality)\b|\bmicro.?detail", "polish"),
+]
+
+
+def _roots() -> list[str]:
+    """Skill roots, from hermes config if available, else known defaults.
+
+    Nested roots are pruned: if A is inside B, only B is walked. Without this a
+    broad root (e.g. ~/AE) silently absorbs every narrower root beneath it.
+    """
+    roots: list[str] = []
+    cfg = Path.home() / ".hermes" / "config.yaml"
+    if cfg.exists():
+        try:
+            txt = cfg.read_text(errors="replace")
+            block = re.search(r"^skills:\s*\n(.*?)(?=^\S|\Z)", txt, re.M | re.S)
+            if block:
+                roots += re.findall(r"^\s*-\s+(/\S+)", block.group(1), re.M)
+        except Exception:
+            pass
+    roots += [str(Path.home() / ".agents" / "skills"),
+              str(Path.home() / ".claude" / "skills")]
+    cand, seen = [], set()
+    for r in roots:
+        p = Path(r).expanduser()
+        if not p.is_dir():
+            continue
+        rp = os.path.realpath(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        cand.append((rp, str(p)))
+    # keep only roots not contained in another root
+    pruned = []
+    for rp, orig in sorted(cand):
+        if any(rp != orp and rp.startswith(orp + os.sep) for orp, _ in cand):
+            continue
+        pruned.append(orig)
+    return sorted(pruned)
+
+
+def _note_nested(nested: list[str]) -> None:
+    try:
+        f = CACHE.parent / "nested-roots.txt"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join(nested) + "\n")
+    except Exception:
+        pass
+
+
+def _fm(path: Path) -> tuple[str, str, str]:
+    """Return (name, description, body_sha) without reading the whole file."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4000)
+    except Exception:
+        return (path.parent.name, "", "")
+    body, fm = head, ""
+    if head.startswith("---"):
+        end = head.find("\n---", 3)
+        if end > 0:
+            fm, body = head[3:end], head[end + 4:]
+        else:
+            body = head
+    m = re.search(r"^name:\s*[\"']?([^\"'\n]+)", fm, re.M)
+    name = m.group(1).strip() if m else path.parent.name
+    d = re.search(r"^description:\s*(.+?)(?=\n[a-zA-Z_-]+:\s|\n---|\Z)", fm, re.M | re.S)
+    desc = re.sub(r"\s+", " ", d.group(1)).strip().strip("\"'") if d else ""
+    sha = hashlib.sha256(re.sub(r"\s+", " ", body).encode()).hexdigest()[:12]
+    return (name, desc, sha)
+
+
+def build_index(force: bool = False) -> dict:
+    if not force and CACHE.exists() and time.time() - CACHE.stat().st_mtime < CACHE_TTL:
+        try:
+            return json.loads(CACHE.read_text())
+        except Exception:
+            pass
+    idx = {"version": VERSION, "built": time.time(), "roots": [], "skills": {}, "stats": {}}
+    nested: list[str] = []
+    for root in _roots():
+        n = 0
+        seen_dirs: set[str] = set()
+        for dirpath, dirnames, files in os.walk(root, followlinks=True):
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("node_modules", ".git", "__pycache__", "bin", "dist")]
+            if "SKILL.md" not in files:
+                continue
+            p = Path(dirpath) / "SKILL.md"
+            real = os.path.realpath(p)
+            if real in seen_dirs:
+                continue
+            seen_dirs.add(real)
+            # A symlinked SKILL.md can dangle (stale plugin link, moved repo).
+            # Indexing a path we cannot read makes every downstream answer a
+            # lie, so verify before trusting it.
+            try:
+                name, desc, sha = _fm(p)
+            except OSError:
+                continue
+            if not sha:
+                continue
+            rel = os.path.relpath(p, root)
+            hm = HOSTS.search(rel)
+            host = hm.group(1) if hm else ""
+            e = idx["skills"].setdefault(name, {
+                "name": name, "desc": desc, "sha": sha, "copies": [], "hosts": set()})
+            e["copies"].append(str(p))
+            if host:
+                e["hosts"].add(host)
+            n += 1
+        if n:
+            idx["roots"].append({"path": root, "count": n})
+        else:
+            nested.append(root)
+    for e in idx["skills"].values():
+        e["hosts"] = sorted(e["hosts"])
+        e["copies"].sort()
+    names = idx["skills"]
+    idx["stats"] = {
+        "roots": len(idx["roots"]),
+        "files": sum(len(v["copies"]) for v in names.values()),
+        "skills": len(names),
+        "mirrored": sum(1 for v in names.values() if len(v["copies"]) > 1),
+        "stubs": sum(1 for v in names.values() if STUB_RE.search(
+            "description: " + v["desc"])),
+        "modifiers": sum(1 for v in names.values()
+                         if re.search(r"invoke /?\w[\w-]*\s+—", v["desc"], re.I)),
+    }
+    if nested:
+        idx["stats"]["empty_roots"] = len(nested)
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(idx))
+    return idx
+
+
+def find(skill: str) -> dict | None:
+    return build_index().get("skills", {}).get(skill)
+
+
+# ── manifest: declared dependencies ──────────────────────────────────────────
+
+def _plugin_dir() -> Path:
+    """Locate the plugin root from wherever this file lives.
+
+    Layouts supported:
+      <plugin>/bin/skill-route              (standalone checkout)
+      <plugin>/skills/skill-route/bin/...   (aegntic-outcomes monorepo)
+    """
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent, here.parent.parent.parent):
+        if (cand / "manifest.json").exists():
+            return cand
+    return here.parent
+
+
+PLUGIN_DIR = _plugin_dir()
+MANIFEST = PLUGIN_DIR / "manifest.json"
+VENDOR_DIR = PLUGIN_DIR / "vendor"
+
+
+def manifest() -> dict:
+    if not MANIFEST.exists():
+        return {"generated_deps": {"skills": []}, "vendored_deps": []}
+    try:
+        return json.loads(MANIFEST.read_text())
+    except Exception as e:
+        raise SystemExit(f"skill-route: corrupt manifest {MANIFEST}: {e}")
+
+
+def all_deps() -> list[str]:
+    m = manifest()
+    return sorted(set(m.get("generated_deps", {}).get("skills", []))
+                  | set(m.get("vendored_deps", [])))
+
+
+def routed_targets() -> list[str]:
+    return sorted({d[0] for _, d in ROUTES} | {n for _, n in MODIFIER_ROUTES})
+
+
+def doctor() -> int:
+    """Verify every routed-to skill resolves. Never exits 0 with a phantom."""
+    idx = build_index()
+    skills = idx["skills"]
+    m = manifest()
+    gen = set(m.get("generated_deps", {}).get("skills", []))
+    ven = set(m.get("vendored_deps", []))
+    declared = gen | ven
+    routed = routed_targets()
+
+    print(f"skill-route {VERSION}  ·  dependency doctor\n")
+    missing, ok, shadowed = [], 0, []
+    for name in routed:
+        entry = skills.get(name)
+        vendored = (VENDOR_DIR / name).exists()
+        if entry or vendored:
+            ok += 1
+            src = "vendor/" if vendored and not entry else (
+                entry["copies"][0] if entry else "?")
+            if entry and vendored:
+                shadowed.append(name)
+            print(f"  ✓ {name:20s} {src}")
+        else:
+            missing.append(name)
+            tag = "generated" if name in gen else ("vendored-decl" if name in ven else "UNDECLARED")
+            print(f"  ✗ {name:20s} MISSING ({tag})")
+
+    undeclared = [n for n in routed if n not in declared]
+    unused = sorted(declared - set(routed))
+
+    print(f"\n{ok}/{len(routed)} routers resolve.")
+    if shadowed:
+        print(f"note: {len(shadowed)} resolvable from both vendor/ and the corpus "
+              f"(corpus wins): {', '.join(shadowed[:6])}")
+    if undeclared:
+        print(f"WARN undeclared in manifest.json: {', '.join(undeclared)}")
+    if unused:
+        print(f"WARN declared but never routed: {', '.join(unused)}")
+    if missing:
+        gen_missing = [n for n in missing if n in gen]
+        print(f"\n{len(missing)} MISSING — the router can emit these but cannot run them.")
+        if gen_missing:
+            g = m["generated_deps"]
+            print(f"  {len(gen_missing)} come from the '{g.get('plugin')}' plugin:")
+            print(f"    {g.get('install')}")
+        print("  Until installed, skill-route prints '(not installed)' rather than "
+              "silently routing to nothing.")
+        return 1
+    print("all routers resolve ✓")
+    return 0
+
+
+def bundle(force: bool = False) -> int:
+    """Copy vendorable deps into vendor/ so the plugin is self-contained."""
+    idx = build_index()
+    skills = idx["skills"]
+    m = manifest()
+    gen = set(m.get("generated_deps", {}).get("skills", []))
+    ven = m.get("vendored_deps", [])
+    if not ven:
+        print("manifest declares no vendored deps")
+        return 0
+
+    VENDOR_DIR.mkdir(exist_ok=True)
+    copied = skipped = 0
+    for name in ven:
+        dest = VENDOR_DIR / name
+        if dest.exists() and not force:
+            skipped += 1
+            continue
+        entry = skills.get(name)
+        if not entry:
+            print(f"  ! {name}: not installed anywhere — skipping")
+            continue
+        # Pick a source that actually exists. The index may list several
+        # copies; a stale one (dangling symlink) must not be chosen.
+        src = next((Path(c).parent for c in entry["copies"]
+                    if Path(c).is_file() and Path(c).parent.is_dir()), None)
+        if src is None:
+            print(f"  ! {name}: no readable copy — skipping")
+            continue
+        if dest.exists():
+            import shutil
+            shutil.rmtree(dest)
+        import shutil
+        shutil.copytree(src, dest, symlinks=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+        copied += 1
+        print(f"  + vendor/{name}")
+
+    print(f"\nvendored: {copied} copied, {skipped} already present, "
+          f"{len(gen)} generated dep(s) not vendored (by design)")
+    total = sum(f.stat().st_size for f in VENDOR_DIR.rglob("*") if f.is_file())
+    print(f"vendor/ size: {total / 1024:.0f} KB")
+    return 0
+
+
+def route(query: str) -> list[dict]:
+    q = query.lower().strip()
+    if not q:
+        return []
+    idx = build_index()
+    hits: list[dict] = []
+
+    # 1. exact skill name mentioned in the query.
+    #    Only for unambiguous names: not a stopword; multi-hyphen, or vetted.
+    exact: list[dict] = []
+    for m in re.finditer(r"(?:^|\s)/?([a-z][a-z0-9-]{2,})(?=$|\s|[.,!?])", q):
+        tok = m.group(1).rstrip("-")
+        if tok in STOPWORDS or tok not in idx["skills"]:
+            continue
+        if "-" in tok or tok in SINGLE_WORD_OK:
+            exact.append({"skill": tok, "why": f"named explicitly (“{tok}”)",
+                          "confidence": "exact", "span": m.span(1)})
+
+    # 2. intent patterns. A pattern that *contains* a named token is more
+    #    specific than the bare token ("review the architecture" beats the
+    #    word "review"), so its span suppresses the exact hit inside it.
+    intent: list[dict] = []
+    for pat, dests in ROUTES:
+        m = re.search(pat, q)
+        if not m:
+            continue
+        sp = m.span()
+        intent.append({"skill": dests[0], "why": f"intent “{m.group(0)}”",
+                       "confidence": "high", "span": sp})
+        for e in exact:
+            if e["span"][0] < sp[1] and sp[0] < e["span"][1]:
+                e["suppressed"] = True
+
+    # 3. modifier verbs — the impeccable family. Named or implied, the modifier
+    #    leads and impeccable follows it.
+    for pat, dest in MODIFIER_ROUTES:
+        m = re.search(pat, q)
+        if m:
+            intent.insert(0, {"skill": dest, "why": f"design verb “{m.group(0)}”",
+                              "confidence": "high", "span": m.span()})
+            if dest in idx["skills"] and dest != "impeccable":
+                intent.insert(1, {"skill": "impeccable",
+                                  "why": f"{dest} delegates to impeccable",
+                                  "confidence": "high", "span": m.span()})
+
+    hits = [e for e in exact if not e.get("suppressed")] + intent
+    seen, out = set(), []
+    for h in hits:
+        if h["skill"] not in seen:
+            seen.add(h["skill"]); out.append(h)
+    return out
+
+
+def _display(q: str, limit: int = 60) -> str:
+    """Safe, bounded rendering of a query for terminal output."""
+    q = " ".join(q.split())
+    if len(q) > limit:
+        q = q[:limit] + "…"
+    return repr(q)
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    flags: set[str] = set()
+    args: list[str] = []
+    passthrough = False
+    for a in argv:
+        if passthrough:
+            args.append(a)
+        elif a == "--":
+            passthrough = True
+        elif a.startswith("--") and len(a) > 2:
+            flags.add(a)
+        else:
+            args.append(a)
+    if "--refresh" in flags:
+        build_index(force=True); print("index rebuilt"); return 0
+    if "--doctor" in flags:
+        return doctor()
+    if "--bundle" in flags:
+        return bundle(force="--force" in flags)
+
+    idx = build_index()
+    s = idx["stats"]
+    # NB: check --index / no-args *after* the other flags, otherwise a bare
+    # `--contested` (which has no positional args) gets swallowed here.
+    if "--contested" in flags:
+        rows = sorted((v for v in idx["skills"].values() if len(v["copies"]) > 1),
+                      key=lambda v: -len(v["copies"]))
+        for v in rows[:40]:
+            print(f"{len(v['copies']):3d}x  {v['name']}")
+        print(f"\n{len(rows)} skills have >1 path. "
+              f"Check hosts/*.ts before consolidating — generated variants differ.")
+        return 0
+    if "--dead" in flags:
+        rows = [v for v in idx["skills"].values()
+                if STUB_RE.search("description: " + v["desc"])]
+        for v in sorted(rows, key=lambda x: x["name"]):
+            print(f"{v['name']:44s} {len(v['copies'])}x")
+        print(f"\n{len(rows)} content-free import stubs.")
+        return 0
+    if "--resolve" in flags and args:
+        v = idx["skills"].get(" ".join(args))
+        if not v:
+            print(f"no skill named {' '.join(args)!r}"); return 1
+        print(f"{v['name']}\n  {v['desc'][:160]}")
+        print(f"  copies: {len(v['copies'])}  hosts: {','.join(v['hosts']) or '-'}")
+        for c in v["copies"][:6]:
+            print(f"    {c}")
+        if len(v["copies"]) > 6:
+            print(f"    … {len(v['copies']) - 6} more")
+        return 0
+    if "--index" in flags or not args:
+        print(f"skill-route {VERSION}  ·  {s['files']} files / {s['skills']} skills "
+              f"across {s['roots']} roots")
+        print(f"  mirrored: {s['mirrored']}   import-stubs: {s['stubs']}")
+        for r in idx["roots"]:
+            print(f"    {r['count']:5d}  {r['path']}")
+        return 0
+
+    q = " ".join(args)
+
+    hits = route(q)
+    if not hits:
+        print(f"no route for {_display(q)}")
+        print("failing that: grep the corpus, or check --index")
+        return 2
+
+    # A route to a skill that is neither installed nor vendored is a phantom.
+    # Say so loudly rather than handing the user a skill that will not load.
+    resolved, phantoms = [], []
+    for h in hits:
+        (resolved if (h["skill"] in idx["skills"]
+                      or (VENDOR_DIR / h["skill"]).exists()) else phantoms).append(h)
+
+    print(f"skill-route {VERSION}  ·  {_display(q)}\n")
+    for h in resolved[:5]:
+        v = idx["skills"].get(h["skill"])
+        tag = "" if v else "   (from vendor/)"
+        print(f"  → {h['skill']}{tag}")
+        print(f"      {h['why']}")
+        if v:
+            print(f"      {v['desc'][:120]}")
+    if phantoms and not resolved:
+        names = ", ".join(h["skill"] for h in phantoms[:4])
+        print(f"  ✗ no installed skill for this request.")
+        print(f"    would route to: {names}")
+        print(f"    run 'skill-route --doctor' for how to install, or")
+        print(f"    'skill-route --bundle' to vendor what can be vendored.")
+        return 3
+    if phantoms:
+        print(f"\n  (also considered, not installed: "
+              f"{', '.join(h['skill'] for h in phantoms[:4])})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
